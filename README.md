@@ -1,4 +1,4 @@
-# TyO Assist — Puente de IA v29.1 (gratis con Cloudflare Workers AI)
+# TyO Assist — Puente de IA v29.2 (gratis con Cloudflare Workers AI)
 
 Este puente conecta la app con IA **gratuita** de Cloudflare. No necesitas clave de OpenAI ni de Google, y **la app no cambia**: solo le pones la URL del puente y tu token en ⚙️ Ajustes.
 
@@ -10,7 +10,8 @@ Este puente conecta la app con IA **gratuita** de Cloudflare. No necesitas clave
 | Uso | Modelo principal | Respaldo |
 |---|---|---|
 | Notas y texto | Gemma 4 26B (`@cf/google/gemma-4-26b-a4b-it`) | Llama 4 Scout (`@cf/meta/llama-4-scout-17b-16e-instruct`) |
-| Fotos (laboratorio, Rx) | Llama 4 Scout (responde sin «pensar», más rápido con fotos) | Gemma 4 26B |
+| Fotos de laboratorio | Llama 4 Scout (responde sin «pensar», más rápido con fotos) | Gemma 4 26B |
+| Radiografías | Doble lectura en paralelo: Llama 4 Scout + Kimi K2.5. Si cualquiera ve fractura, se reporta | Gemma 4 26B |
 | Audio (dictado) | Whisper large v3 turbo, en español | Whisper |
 
 ---
@@ -79,7 +80,7 @@ Cálculo aproximado con los precios publicados ([precios de Workers AI](https://
 
 ## Cambiar de modelo
 
-Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_VISION`, `MODEL_VISION_BACKUP`, `MODEL_AUDIO` o `MODEL_AUDIO_BACKUP` (en el panel: Settings → Variables; con computadora: `wrangler.toml`). No hace falta tocar el código ni la app. Alternativas gratuitas para texto: `@cf/openai/gpt-oss-120b` y `@cf/mistralai/mistral-small-3.1-24b-instruct`. Evita los modelos que Cloudflare marca como de pago (por ejemplo DeepSeek V4, GLM 5.x y Kimi K2.6).
+Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_VISION`, `MODEL_VISION_BACKUP`, `MODEL_RX`, `MODEL_RX_SECOND`, `MODEL_AUDIO` o `MODEL_AUDIO_BACKUP` (en el panel: Settings → Variables; con computadora: `wrangler.toml`). No hace falta tocar el código ni la app. Alternativas gratuitas para texto: `@cf/openai/gpt-oss-120b` y `@cf/mistralai/mistral-small-3.1-24b-instruct`. Evita los modelos que Cloudflare marca como de pago (por ejemplo DeepSeek V4, GLM 5.x y Kimi K2.6).
 
 ## Problemas frecuentes
 
@@ -97,6 +98,20 @@ Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_VISION`, `MODEL_VI
 | «Formato de imagen no compatible» | Usa JPG, PNG o WebP. |
 
 Para ver errores en vivo con computadora: `npx wrangler tail`. Solo verás qué modelo falló y por qué, nunca el contenido clínico.
+
+## Radiografías: qué esperar
+
+Los modelos gratuitos son de uso general, no radiólogos: **pueden pasar por alto fracturas evidentes**. Por eso el puente:
+
+- Hace **dos lecturas en paralelo** con modelos distintos. Si cualquiera identifica fractura, se reporta, y si no coinciden se avisa.
+- Les da una guía de lectura sistemática: proyección por anatomía y revisión hueso por hueso.
+- Aplica un **candado**: si ninguna lectura ve fractura, la app nunca muestra «no se observa fractura». Muestra «NO IDENTIFICADA POR LA IA — ESTO NO DESCARTA FRACTURA».
+
+Para mejores resultados recorta la foto a la placa, sin reflejos ni la franja con el nombre del paciente. Una radiografía con doble lectura consume aproximadamente entre 400 y 600 neuronas.
+
+## Cambios en v29.2
+
+- Doble lectura de radiografías, guía de lectura sistemática y candado contra falsos negativos.
 
 ## Cambios en v29.1
 

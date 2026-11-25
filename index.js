@@ -1,5 +1,5 @@
 /**
- * TyO Assist — Puente de IA v29
+ * TyO Assist — Puente de IA v29.2
  * Proveedor: Cloudflare Workers AI (plan gratuito: 10,000 neuronas al día, sin tarjeta).
  *
  * - Un solo archivo y sin dependencias: se puede pegar tal cual en el editor del panel de Cloudflare.
@@ -9,7 +9,7 @@
  * - No guarda ni registra el contenido clínico.
  */
 
-const VERSION = "29.1";
+const VERSION = "29.2";
 const SERVICE = "tyo-assist-proxy"; // nombre que espera el botón «Probar conexión» de la app
 
 const DEFAULTS = {
@@ -18,6 +18,9 @@ const DEFAULTS = {
   // Fotos: primero Llama 4 Scout (multimodal, responde sin «pensar»), luego Gemma 4.
   MODEL_VISION: "@cf/meta/llama-4-scout-17b-16e-instruct",
   MODEL_VISION_BACKUP: "@cf/google/gemma-4-26b-a4b-it",
+  // Radiografías: doble lectura en paralelo con dos modelos distintos (si cualquiera ve fractura, se reporta).
+  MODEL_RX: "@cf/meta/llama-4-scout-17b-16e-instruct",
+  MODEL_RX_SECOND: "@cf/moonshotai/kimi-k2.5",
   MODEL_AUDIO: "@cf/openai/whisper-large-v3-turbo",
   MODEL_AUDIO_BACKUP: "@cf/openai/whisper",
   MAX_OUTPUT_TOKENS: 4096
@@ -71,6 +74,7 @@ function config(env) {
   return {
     textModels: unique([pick("MODEL_TEXT"), pick("MODEL_TEXT_BACKUP")]),
     visionModels: unique([pick("MODEL_VISION"), pick("MODEL_VISION_BACKUP")]),
+    rxModels: unique([pick("MODEL_RX"), pick("MODEL_RX_SECOND")]),
     audioModels: unique([pick("MODEL_AUDIO"), pick("MODEL_AUDIO_BACKUP")]),
     maxTokens: Number.isFinite(max) ? Math.min(Math.max(max, 512), 8192) : DEFAULTS.MAX_OUTPUT_TOKENS,
     budget: Number.isFinite(budget) ? Math.min(Math.max(budget, 1000), 44_000) : DEFAULT_TIME_BUDGET_MS
@@ -419,6 +423,102 @@ async function transcribe(env, audios, sys, cfg, start) {
 // Texto e imagen → respuesta (modelos de lenguaje)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Radiografías: lectura sistemática, doble lectura y candado contra falsos negativos
+// ---------------------------------------------------------------------------
+
+const RX_GUIDE = [
+  "LECTURA SISTEMÁTICA OBLIGATORIA antes de llenar el JSON:",
+  "1) La imagen puede ser una foto de un monitor: ignora botones, textos, reglas y marcos de la interfaz; analiza solo la radiografía.",
+  "2) Identifica la proyección por la anatomía visible. Ejemplo en rodilla: en la lateral la rótula se ve de perfil por delante del fémur distal y los cóndilos se superponen; en la AP la rótula se proyecta sobre el fémur distal.",
+  "3) Revisa uno por uno TODOS los huesos visibles (ejemplo en rodilla: fémur distal, rótula, tibia proximal y peroné proximal) buscando interrupción de la cortical, líneas radiolúcidas, fragmentos óseos separados, escalones, angulación o desalineación.",
+  "4) Si ves fragmentos separados o una cortical interrumpida, descríbelo como fractura (hueso, localización, número de fragmentos y separación) aunque no estés seguro de la clasificación.",
+  "5) Escribe que no hay fractura solo después de revisar todos los huesos y comprobar que todas las corticales se ven continuas."
+].join("\n");
+
+const RX_LOCK_TEXT = "[NO IDENTIFICADA POR LA IA — ESTO NO DESCARTA FRACTURA. Revisar la placa directamente.]";
+const RX_LIMIT_NEG = "Las IA gratuitas pueden pasar por alto fracturas evidentes: un resultado negativo nunca descarta lesión.";
+const RX_LIMIT_PROY = "La proyección indicada por la IA puede ser incorrecta: verifíquela en la placa.";
+// Frases que NIEGAN una fractura ("no se observa trazo…", "sin fractura…", "trazo no evidente").
+// Se quitan del texto y, si en lo que queda se menciona una fractura, la lectura cuenta como positiva.
+const RX_NEG_PHRASE = /(\bno\s+se\s+(?:observa|observan|identifica|identifican|aprecia|aprecian|evidencia|evidencian|visualiza|visualizan|detecta|detectan)\b[^.;\n]*|\bsin\s+(?:evidencia\s+de\s+|datos\s+de\s+|signos\s+de\s+)?(?:trazo|fractura|fragment|discontinu|lesi[oó]n\s+[oó]sea)[^.;\n]*|\bausencia\s+de\b[^.;\n]*|\bno\s+hay\b[^.;\n]*|\bno\s+(?:existe|existen|presenta|presentan)\b[^.;\n]*|(?:trazo|fractura)[^.;\n]*\bno\s+(?:es\s+)?(?:evidente|visible|identificable|valorable)[^.;\n]*)/gi;
+const RX_POSITIVE = /(fractur|trazo|fragment|discontinu|conminu|avulsi|separaci[oó]n\s+de|l[ií]nea\s+radiol[uú]cida)/i;
+const RX_KEEP = /(luxaci|subluxaci|escal[oó]n|hundimiento|depresi[oó]n|intraarticular|derrame|gas|fragment|fractur|desplazad[oa]\s+\d|angulaci[oó]n\s+de\s+\d)/i;
+const RX_NEGATIVE_WORDS = /\b(no|sin|ausencia|normal(?:es)?|conservad[oa]s?|[ií]ntegr[oa]s?|congruente[s]?|adecuad[oa]s?)\b/i;
+
+function isRxSchema(schema) {
+  return !!(schema && schema.properties && schema.properties.patron_y_trazo);
+}
+
+function rxIsPositive(obj) {
+  const p = String((obj && obj.patron_y_trazo) || "");
+  const rest = p.replace(RX_NEG_PHRASE, " ");
+  return RX_POSITIVE.test(rest);
+}
+
+function pushUnique(arr, text) {
+  const list = Array.isArray(arr) ? arr.slice() : [];
+  if (!list.some((x) => String(x).trim() === text)) list.push(text);
+  return list;
+}
+
+// Se usa solo cuando ninguna lectura identificó fractura: nunca deja pasar «no hay fractura» como conclusión.
+function rxLockNegatives(obj) {
+  const out = { ...obj };
+  out.patron_y_trazo = RX_LOCK_TEXT;
+  for (const k of ["desplazamiento_y_angulacion", "compromiso_articular"]) {
+    const v = String(out[k] || "").trim();
+    if (!v || (RX_NEGATIVE_WORDS.test(v) && !RX_KEEP.test(v))) out[k] = "[NO VALORABLE POR LA IA — revisar en la placa.]";
+  }
+  out.limitaciones_o_no_valorable = pushUnique(pushUnique(out.limitaciones_o_no_valorable, RX_LIMIT_NEG), RX_LIMIT_PROY);
+  return out;
+}
+
+function rxMerge(results, schema) {
+  // results: [{ model, obj }], en orden de prioridad
+  const positives = results.filter((r) => rxIsPositive(r.obj));
+  if (positives.length) {
+    const chosen = positives[0];
+    let obj = { ...chosen.obj };
+    obj.limitaciones_o_no_valorable = pushUnique(obj.limitaciones_o_no_valorable, RX_LIMIT_PROY);
+    const negatives = results.filter((r) => !rxIsPositive(r.obj));
+    if (negatives.length) {
+      obj.limitaciones_o_no_valorable = pushUnique(obj.limitaciones_o_no_valorable, "Lecturas de IA discordantes: un modelo identificó fractura y otro no. Revisar la placa directamente.");
+    }
+    return { obj: repair(obj, schema), model: chosen.model };
+  }
+  return { obj: repair(rxLockNegatives(results[0].obj), schema), model: results[0].model };
+}
+
+async function rxDoubleRead(env, messages, opts, cfg, start) {
+  const models = cfg.rxModels;
+  const deadline = start + Math.round(cfg.budget * 0.75);
+  const minMs = minAttemptMs(cfg);
+  const settled = [];
+  const failures = [];
+  await new Promise((resolve) => {
+    let pending = models.length;
+    models.forEach((model, idx) => {
+      runChat(env, model, messages, opts, deadline, minMs)
+        .then((text) => {
+          const obj = parseJsonLoose(text);
+          if (!obj) throw new Reintentable("la respuesta no fue JSON válido");
+          settled.push({ idx, model, obj: repair(rewrapTopLevel(obj, opts.schema), opts.schema) });
+          if (rxIsPositive(settled[settled.length - 1].obj)) resolve(); // fractura identificada: no hace falta esperar
+        })
+        .catch((e) => {
+          if (e instanceof PuenteError) { failures.push(e); resolve(); return; }
+          failures.push(new Reintentable(model.split("/").pop().split("-").slice(0, 2).join("-") + ": " + errorText(e).slice(0, 70)));
+        })
+        .finally(() => { pending -= 1; if (pending === 0) resolve(); });
+    });
+  });
+  const quota = failures.find((f) => f instanceof PuenteError);
+  if (quota && !settled.length) throw quota;
+  settled.sort((a, b) => a.idx - b.idx);
+  return { results: settled, reasons: failures.filter((f) => !(f instanceof PuenteError)).map((f) => f.message) };
+}
+
 function buildSystem(sys, schema, wantsJson) {
   const blocks = [sys ? sys + "\n\n" + GUARD : GUARD];
   if (wantsJson) blocks.push("FORMATO DE SALIDA: responde únicamente con un objeto JSON válido, sin texto antes ni después y sin bloques de código.");
@@ -427,7 +527,7 @@ function buildSystem(sys, schema, wantsJson) {
 }
 
 function tokenParam(model) {
-  return /gemma-4/.test(model) ? "max_completion_tokens" : "max_tokens";
+  return /gemma-4|kimi/.test(model) ? "max_completion_tokens" : "max_tokens";
 }
 
 async function runChat(env, model, messages, opts, deadline, minMs) {
@@ -435,6 +535,7 @@ async function runChat(env, model, messages, opts, deadline, minMs) {
   base[tokenParam(model)] = opts.maxTokens;
   // Gemma 4 razona antes de responder; para redactar o extraer datos no hace falta y solo agrega espera.
   if (/gemma-4/.test(model)) base.chat_template_kwargs = { enable_thinking: false };
+  if (/kimi/.test(model)) base.reasoning_effort = "low";
   const withFormat = opts.schema
     ? { ...base, response_format: { type: "json_schema", json_schema: opts.schema } }
     : opts.wantsJson ? { ...base, response_format: { type: "json_object" } } : base;
@@ -492,9 +593,23 @@ async function generate(body, env, start) {
     { role: "user", content: userContent }
   ];
 
-  const models = images.length ? cfg.visionModels : cfg.textModels;
+  let models = images.length ? cfg.visionModels : cfg.textModels;
   const maxTokens = images.length ? Math.min(cfg.maxTokens, VISION_MAX_TOKENS) : cfg.maxTokens;
   const reasons = [];
+  const rx = images.length > 0 && isRxSchema(schema);
+
+  if (rx) {
+    messages[0].content = buildSystem(sys + "\n\n" + RX_GUIDE, schema, wantsJson);
+    const dbl = await rxDoubleRead(env, messages, { schema, wantsJson, temperature, maxTokens }, cfg, start);
+    if (dbl.results.length) {
+      const merged = rxMerge(dbl.results, schema);
+      return geminiEnvelope(JSON.stringify(merged.obj), merged.model);
+    }
+    reasons.push(...dbl.reasons);
+    // Ninguna lectura respondió: último intento con el modelo de respaldo de fotos.
+    models = cfg.visionModels.filter((m) => !cfg.rxModels.includes(m));
+  }
+
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
     const deadline = attemptDeadline(start, cfg, i === models.length - 1);
@@ -505,6 +620,7 @@ async function generate(body, env, start) {
         let obj = parseJsonLoose(text);
         if (!obj) throw new Reintentable("la respuesta no fue JSON válido");
         if (schema) obj = repair(rewrapTopLevel(obj, schema), schema);
+        if (rx) obj = rxMerge([{ model, obj }], schema).obj;
         return geminiEnvelope(JSON.stringify(obj), model);
       }
       if (!text) throw new Reintentable("respuesta vacía");
@@ -532,7 +648,7 @@ function health(env) {
     keyConfigured: !!(env.AI && typeof env.AI.run === "function"),
     tokenProtected: true,
     originsRestricted: configuredOrigins(env).length > 0,
-    models: { texto: cfg.textModels, imagen: cfg.visionModels, audio: cfg.audioModels }
+    models: { texto: cfg.textModels, imagen: cfg.visionModels, radiografia: cfg.rxModels, audio: cfg.audioModels }
   };
 }
 

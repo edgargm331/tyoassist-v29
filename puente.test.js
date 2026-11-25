@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import worker from "./index.js";
 
 const TOKEN = "token-de-prueba-0123456789";
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const APP = "https://tyoassistx.edgargm331.workers.dev";
 const URL_PUENTE = "https://puente.test/";
 
@@ -322,8 +323,144 @@ test("si ambos modelos se cuelgan → 502 antes de que la app corte, nombrando q
 test("«Probar conexión» informa también los modelos de fotos", async () => {
   const res = await worker.fetch(new Request(URL_PUENTE, { headers: { Origin: APP, "X-TyO-Token": TOKEN } }), env(fakeAI(() => ({}))));
   const d = await res.json();
-  assert.equal(d.version, "29.1");
+  assert.equal(d.version, "29.2");
+  assert.deepEqual(d.models.radiografia, ["@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/moonshotai/kimi-k2.5"]);
   assert.deepEqual(d.models.imagen, ["@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/google/gemma-4-26b-a4b-it"]);
+});
+
+// ---------------------------------------------------------------------------
+// Radiografías: doble lectura y candado contra falsos negativos
+// ---------------------------------------------------------------------------
+
+// Esquema real de la app v27 (buildRxVisionResponseSchema)
+const ESQUEMA_RX = {
+  type: "OBJECT",
+  properties: {
+    proyeccion: { type: "STRING" }, calidad_tecnica: { type: "STRING" }, calidad_inadecuada: { type: "BOOLEAN" },
+    hueso_y_segmento: { type: "STRING" }, patron_y_trazo: { type: "STRING" }, desplazamiento_y_angulacion: { type: "STRING" },
+    compromiso_articular: { type: "STRING" }, tejidos_blandos_y_material: { type: "STRING" }, clasificacion_orientativa: { type: "STRING" },
+    banderas_rojas_rx: { type: "ARRAY", items: { type: "STRING" } }, proyecciones_o_estudios_sugeridos: { type: "ARRAY", items: { type: "STRING" } },
+    limitaciones_o_no_valorable: { type: "ARRAY", items: { type: "STRING" } }
+  },
+  required: ["proyeccion", "calidad_tecnica", "calidad_inadecuada", "hueso_y_segmento", "patron_y_trazo", "desplazamiento_y_angulacion", "compromiso_articular", "tejidos_blandos_y_material", "clasificacion_orientativa", "banderas_rojas_rx", "proyecciones_o_estudios_sugeridos", "limitaciones_o_no_valorable"]
+};
+
+function solicitudRx() {
+  return {
+    contents: [{ parts: [{ text: "Analiza esta radiografía ortopédica." }, { inline_data: { mime_type: "image/jpeg", data: PNG_1PX } }] }],
+    generationConfig: { temperature: 0.05, responseMimeType: "application/json", responseSchema: ESQUEMA_RX },
+    systemInstruction: { parts: [{ text: "Eres un asistente de descripción radiográfica sistemática." }] }
+  };
+}
+
+function lecturaRx(patron, extra = {}) {
+  return { response: JSON.stringify({ proyeccion: "Lateral de rodilla", calidad_tecnica: "Adecuada", calidad_inadecuada: false, hueso_y_segmento: "Rodilla", patron_y_trazo: patron, desplazamiento_y_angulacion: "No se observa desplazamiento.", compromiso_articular: "Sin compromiso articular.", tejidos_blandos_y_material: "Sin alteraciones.", clasificacion_orientativa: "[NO APLICA]", banderas_rojas_rx: [], proyecciones_o_estudios_sugeridos: [], limitaciones_o_no_valorable: ["Sin marcador de lateralidad."], ...extra }) };
+}
+
+const NEG = "No se observa trazo de fractura evidente.";
+const POS = "Fractura transversa de rótula con separación de fragmentos.";
+const LOCK = /NO IDENTIFICADA POR LA IA — ESTO NO DESCARTA FRACTURA/;
+
+test("Rx: si ningún modelo ve fractura, la app NUNCA recibe «no se observa fractura» (candado)", async () => {
+  const ai = fakeAI(() => lecturaRx(NEG));
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudRx()), env(ai))));
+  assert.match(obj.patron_y_trazo, LOCK);
+  assert.match(obj.desplazamiento_y_angulacion, /NO VALORABLE POR LA IA/);
+  assert.match(obj.compromiso_articular, /NO VALORABLE POR LA IA/);
+  assert.ok(obj.limitaciones_o_no_valorable.some((x) => /un resultado negativo nunca descarta/.test(x)));
+  assert.ok(obj.limitaciones_o_no_valorable.some((x) => /proyección indicada por la IA puede ser incorrecta/.test(x)));
+  assert.ok(obj.limitaciones_o_no_valorable.includes("Sin marcador de lateralidad."), "conserva las limitaciones del modelo");
+  assert.equal(new Set(ai.calls.map((c) => c.model)).size, 2, "se hicieron dos lecturas con modelos distintos");
+});
+
+test("Rx: doble lectura — si el segundo modelo ve la fractura, se reporta y se avisa la discordancia", async () => {
+  const ai = fakeAI((model) => model.includes("kimi") ? lecturaRx(POS) : lecturaRx(NEG));
+  const res = await worker.fetch(post(solicitudRx()), env(ai));
+  const data = await res.clone().json();
+  const obj = JSON.parse(await comoLaApp(res));
+  assert.equal(obj.patron_y_trazo, POS);
+  assert.equal(data.modelVersion, "@cf/moonshotai/kimi-k2.5");
+  assert.ok(obj.limitaciones_o_no_valorable.some((x) => /discordantes/.test(x)));
+});
+
+test("Rx: si una lectura ve fractura pronto, no espera a la otra (que se quedó colgada)", async () => {
+  const ai = fakeAI((model) => model.includes("kimi") ? new Promise(() => {}) : lecturaRx(POS));
+  const t0 = Date.now();
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudRx()), env(ai))));
+  assert.equal(obj.patron_y_trazo, POS);
+  assert.ok(Date.now() - t0 < 1000, "respondió de inmediato");
+});
+
+test("Rx: si una lectura es negativa, sí espera la segunda opinión antes de responder", async () => {
+  const ai = fakeAI(async (model) => {
+    if (model.includes("kimi")) { await sleepMs(300); return lecturaRx(POS); }
+    return lecturaRx(NEG);
+  });
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudRx()), env(ai))));
+  assert.equal(obj.patron_y_trazo, POS);
+});
+
+test("Rx: frases mixtas — se detecta la fractura aunque el texto diga «íntegra» o niegue otra cosa", async () => {
+  const casos = [
+    ["Fractura transversa de rótula; tibia íntegra y peroné sin alteraciones.", true],
+    ["Sin trazo de fractura en tibia; fragmento óseo desplazado en polo inferior de rótula.", true],
+    ["Trazo de fractura no evidente.", false],
+    ["Sin evidencia de fractura.", false],
+    ["No hay fractura ni luxación.", false],
+    ["Discontinuidad cortical en polo superior de rótula.", true]
+  ];
+  for (const [patron, positivo] of casos) {
+    const ai = fakeAI(() => lecturaRx(patron));
+    const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudRx()), env(ai))));
+    if (positivo) assert.equal(obj.patron_y_trazo, patron, "debió conservarse: " + patron);
+    else assert.match(obj.patron_y_trazo, LOCK, "debió bloquearse: " + patron);
+  }
+});
+
+test("Rx: una luxación descrita se conserva aunque no se identifique fractura", async () => {
+  const ai = fakeAI(() => lecturaRx(NEG, { compromiso_articular: "Luxación lateral de rótula." }));
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudRx()), env(ai))));
+  assert.equal(obj.compromiso_articular, "Luxación lateral de rótula.");
+  assert.match(obj.patron_y_trazo, LOCK);
+});
+
+test("Rx: instrucciones de lectura sistemática, Kimi con razonamiento bajo y 2048 tokens", async () => {
+  const ai = fakeAI(() => lecturaRx(NEG));
+  await worker.fetch(post(solicitudRx()), env(ai));
+  const kimi = ai.calls.find((c) => c.model.includes("kimi"));
+  assert.ok(kimi);
+  assert.equal(kimi.input.reasoning_effort, "low");
+  assert.equal(kimi.input.max_completion_tokens, 2048);
+  assert.match(kimi.input.messages[0].content, /LECTURA SISTEMÁTICA OBLIGATORIA/);
+  assert.match(kimi.input.messages[0].content, /rótula/);
+  assert.equal(kimi.input.messages[1].content[1].type, "image_url");
+});
+
+test("Rx: si las dos lecturas fallan, intenta Gemma y aplica el mismo candado", async () => {
+  const ai = fakeAI((model) => model.includes("gemma") ? lecturaRx(NEG) : Promise.reject(new Error("5007: model error")));
+  const res = await worker.fetch(post(solicitudRx()), env(ai));
+  const obj = JSON.parse(await comoLaApp(res));
+  assert.match(obj.patron_y_trazo, LOCK);
+  assert.ok(ai.calls.some((c) => c.model.includes("gemma")));
+});
+
+test("Rx: cuota agotada en las dos lecturas → 429 con hora de renovación", async () => {
+  const ai = fakeAI(() => Promise.reject(new Error("4006: you have used up your daily free allocation of 10,000 neurons")));
+  const res = await worker.fetch(post(solicitudRx()), env(ai));
+  assert.equal(res.status, 429);
+  assert.match((await res.json()).error, /18:00/);
+});
+
+test("Laboratorio (no es Rx): sin doble lectura ni candado", async () => {
+  const ai = fakeAI(() => ({ response: "{\"estudios\":[\"Hb 12\"]}" }));
+  const body = {
+    contents: [{ parts: [{ text: "Extrae." }, { inline_data: { mime_type: "image/png", data: PNG_1PX } }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: { type: "OBJECT", properties: { estudios: { type: "ARRAY", items: { type: "STRING" } } } } }
+  };
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(body), env(ai))));
+  assert.deepEqual(obj, { estudios: ["Hb 12"] });
+  assert.equal(ai.calls.length, 1);
+  assert.doesNotMatch(ai.calls[0].input.messages[0].content, /LECTURA SISTEMÁTICA/);
 });
 
 // ---------------------------------------------------------------------------
