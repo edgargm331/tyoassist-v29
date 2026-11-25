@@ -1,0 +1,22 @@
+name = "tyo-assist-puente"
+main = "index.js"
+compatibility_date = "2026-06-01"
+
+# Workers AI (plan gratuito). No necesita clave: el Worker lo usa a través de este enlace.
+[ai]
+binding = "AI"
+
+[vars]
+# Direcciones donde está publicada tu app, separadas por coma y sin "/" al final.
+# Si lo dejas vacío se acepta cualquier origen (el token sigue siendo obligatorio).
+ALLOWED_ORIGINS = "https://tyoassistx.edgargm331.workers.dev"
+
+# Modelos (opcional). Si borras estas líneas se usan los mismos valores desde el código.
+MODEL_TEXT = "@cf/google/gemma-4-26b-a4b-it"
+MODEL_TEXT_BACKUP = "@cf/meta/llama-4-scout-17b-16e-instruct"
+MODEL_AUDIO = "@cf/openai/whisper-large-v3-turbo"
+MODEL_AUDIO_BACKUP = "@cf/openai/whisper"
+MAX_OUTPUT_TOKENS = "4096"
+
+# El token NO va en este archivo. Guárdalo como secreto:
+#   npx wrangler secret put APP_ACCESS_TOKEN
