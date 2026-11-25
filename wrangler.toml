@@ -14,6 +14,8 @@ ALLOWED_ORIGINS = "https://tyoassistx.edgargm331.workers.dev"
 # Modelos (opcional). Si borras estas líneas se usan los mismos valores desde el código.
 MODEL_TEXT = "@cf/google/gemma-4-26b-a4b-it"
 MODEL_TEXT_BACKUP = "@cf/meta/llama-4-scout-17b-16e-instruct"
+MODEL_VISION = "@cf/meta/llama-4-scout-17b-16e-instruct"
+MODEL_VISION_BACKUP = "@cf/google/gemma-4-26b-a4b-it"
 MODEL_AUDIO = "@cf/openai/whisper-large-v3-turbo"
 MODEL_AUDIO_BACKUP = "@cf/openai/whisper"
 MAX_OUTPUT_TOKENS = "4096"

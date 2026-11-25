@@ -90,6 +90,18 @@ test("sin token o con token incorrecto → 401 con mensaje en español", async (
   }
 });
 
+test("espacios o saltos de línea invisibles en el secreto o en la app no rompen el token", async () => {
+  for (const secreto of [TOKEN + " ", TOKEN + "\n", "  " + TOKEN]) {
+    const res = await worker.fetch(new Request(URL_PUENTE, { headers: { Origin: APP, "X-TyO-Token": TOKEN } }), env(fakeAI(() => ({})), { APP_ACCESS_TOKEN: secreto }));
+    assert.equal(res.status, 200, JSON.stringify(secreto));
+  }
+  const res2 = await worker.fetch(new Request(URL_PUENTE, { headers: { Origin: APP, "X-TyO-Token": " " + TOKEN + " " } }), env(fakeAI(() => ({}))));
+  assert.equal(res2.status, 200);
+  const res3 = await worker.fetch(new Request(URL_PUENTE, { headers: { Origin: APP, "X-TyO-Token": TOKEN.slice(0, -1) } }), env(fakeAI(() => ({}))));
+  assert.equal(res3.status, 401, "un token distinto sigue rechazado");
+  assert.match((await res3.json()).error, /idéntico/);
+});
+
 test("llamada directa sin Origin (curl) y sin token no llega a la IA", async () => {
   const ai = fakeAI(() => ({ response: "{}" }));
   const req = new Request(URL_PUENTE, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(solicitudNota()) });
@@ -262,6 +274,58 @@ test("archivo de más de 8 MB → 413", async () => {
   assert.equal(res.status, 413);
 });
 
+test("fotos: primero Llama 4 Scout con límite de 2048 tokens; Gemma va sin razonamiento extra", async () => {
+  const ai = fakeAI((model) => {
+    if (model.includes("llama")) throw new Error("5007: model error");
+    return { response: "{\"estudios\":[]}" };
+  });
+  const body = {
+    contents: [{ parts: [{ text: "Describe la Rx." }, { inline_data: { mime_type: "image/jpeg", data: PNG_1PX } }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: { type: "OBJECT", properties: { estudios: { type: "ARRAY", items: { type: "STRING" } } } } }
+  };
+  await comoLaApp(await worker.fetch(post(body), env(ai)));
+  assert.equal(ai.calls[0].model, "@cf/meta/llama-4-scout-17b-16e-instruct");
+  assert.equal(ai.calls[0].input.max_tokens, 2048);
+  const gemma = ai.calls.find((c) => c.model.includes("gemma"));
+  assert.ok(gemma, "el respaldo de fotos es Gemma 4");
+  assert.deepEqual(gemma.input.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(gemma.input.max_completion_tokens, 2048);
+});
+
+test("si el primer modelo se queda colgado, el de respaldo SIEMPRE alcanza a responder a tiempo", async () => {
+  const ai = fakeAI((model) => model.includes("llama")
+    ? new Promise(() => {}) // nunca responde (como la foto que agotó el tiempo)
+    : { response: "{\"estudios\":[\"ok\"]}" });
+  const body = {
+    contents: [{ parts: [{ text: "Rx" }, { inline_data: { mime_type: "image/jpeg", data: PNG_1PX } }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: { type: "OBJECT", properties: { estudios: { type: "ARRAY", items: { type: "STRING" } } } } }
+  };
+  const t0 = Date.now();
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(body), env(ai, { TIME_BUDGET_MS: "3000" }))));
+  const ms = Date.now() - t0;
+  assert.deepEqual(obj.estudios, ["ok"]);
+  assert.ok(ms < 3000, "terminó dentro del presupuesto (" + ms + " ms)");
+  assert.ok(ms >= 1500, "el primer modelo tuvo su turno antes de pasar al respaldo (" + ms + " ms)");
+});
+
+test("si ambos modelos se cuelgan → 502 antes de que la app corte, nombrando qué falló", async () => {
+  const ai = fakeAI(() => new Promise(() => {}));
+  const t0 = Date.now();
+  const res = await worker.fetch(post(solicitudNota()), env(ai, { TIME_BUDGET_MS: "2000" }));
+  assert.equal(res.status, 502);
+  assert.ok(Date.now() - t0 < 2400);
+  const msg = (await res.json()).error;
+  assert.match(msg, /gemma-4: tiempo agotado/);
+  assert.match(msg, /llama-4: tiempo agotado/);
+});
+
+test("«Probar conexión» informa también los modelos de fotos", async () => {
+  const res = await worker.fetch(new Request(URL_PUENTE, { headers: { Origin: APP, "X-TyO-Token": TOKEN } }), env(fakeAI(() => ({}))));
+  const d = await res.json();
+  assert.equal(d.version, "29.1");
+  assert.deepEqual(d.models.imagen, ["@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/google/gemma-4-26b-a4b-it"]);
+});
+
 // ---------------------------------------------------------------------------
 // Audio
 // ---------------------------------------------------------------------------
@@ -315,6 +379,12 @@ test("si Whisper turbo falla, usa Whisper de respaldo con bytes", async () => {
   assert.equal(obj.transcripcion, "Texto del respaldo");
   assert.equal(ai.calls[1].model, "@cf/openai/whisper");
   assert.ok(Array.isArray(ai.calls[1].input.audio));
+});
+
+test("audio: si Whisper turbo se cuelga, el respaldo alcanza a transcribir a tiempo", async () => {
+  const ai = fakeAI((model) => model.includes("turbo") ? new Promise(() => {}) : { text: "Respaldo a tiempo" });
+  const obj = JSON.parse(await comoLaApp(await worker.fetch(post(solicitudAudio()), env(ai, { TIME_BUDGET_MS: "3000" }))));
+  assert.equal(obj.transcripcion, "Respaldo a tiempo");
 });
 
 test("si ningún modelo de audio funciona → 502 sugiriendo el dictado del teléfono", async () => {

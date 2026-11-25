@@ -1,16 +1,16 @@
-# TyO Assist — Puente de IA v29 (gratis con Cloudflare Workers AI)
+# TyO Assist — Puente de IA v29.1 (gratis con Cloudflare Workers AI)
 
 Este puente conecta la app con IA **gratuita** de Cloudflare. No necesitas clave de OpenAI ni de Google, y **la app no cambia**: solo le pones la URL del puente y tu token en ⚙️ Ajustes.
 
 - **Gratis cada día:** 10,000 «neuronas» diarias en el plan gratuito, sin tarjeta. Si se acaban, la IA se pausa hasta las 18:00 (hora del centro de México). En el plan gratuito no hay cobros.
 - **Sin clave que se pueda filtrar:** el Worker usa la IA de Cloudflare directamente con un enlace llamado `AI`.
 - **Privacidad:** Cloudflare declara que no entrena modelos con lo que envías y que no lo conserva después de procesarlo ([política de datos de Workers AI](https://developers.cloudflare.com/workers-ai/platform/data-usage/)). Este puente tampoco registra el contenido. Aun así, la regla sigue: nada que identifique al paciente.
-- **Para que no falle:** si el modelo principal está saturado o responde mal, el puente prueba uno de respaldo. Nunca entrega una nota cortada como si estuviera completa.
+- **Para que no falle:** si el modelo principal está saturado, tarda demasiado o responde mal, el puente prueba uno de respaldo; a cada modelo le toca su propio tiempo, así que el respaldo siempre alcanza a intentar antes de que la app corte. Nunca entrega una nota cortada como si estuviera completa.
 
 | Uso | Modelo principal | Respaldo |
 |---|---|---|
 | Notas y texto | Gemma 4 26B (`@cf/google/gemma-4-26b-a4b-it`) | Llama 4 Scout (`@cf/meta/llama-4-scout-17b-16e-instruct`) |
-| Fotos (laboratorio, Rx) | Gemma 4 26B | Llama 4 Scout |
+| Fotos (laboratorio, Rx) | Llama 4 Scout (responde sin «pensar», más rápido con fotos) | Gemma 4 26B |
 | Audio (dictado) | Whisper large v3 turbo, en español | Whisper |
 
 ---
@@ -79,7 +79,7 @@ Cálculo aproximado con los precios publicados ([precios de Workers AI](https://
 
 ## Cambiar de modelo
 
-Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_AUDIO` o `MODEL_AUDIO_BACKUP` (en el panel: Settings → Variables; con computadora: `wrangler.toml`). No hace falta tocar el código ni la app. Alternativas gratuitas para texto: `@cf/openai/gpt-oss-120b` y `@cf/mistralai/mistral-small-3.1-24b-instruct`. Evita los modelos que Cloudflare marca como de pago (por ejemplo DeepSeek V4, GLM 5.x y Kimi K2.6).
+Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_VISION`, `MODEL_VISION_BACKUP`, `MODEL_AUDIO` o `MODEL_AUDIO_BACKUP` (en el panel: Settings → Variables; con computadora: `wrangler.toml`). No hace falta tocar el código ni la app. Alternativas gratuitas para texto: `@cf/openai/gpt-oss-120b` y `@cf/mistralai/mistral-small-3.1-24b-instruct`. Evita los modelos que Cloudflare marca como de pago (por ejemplo DeepSeek V4, GLM 5.x y Kimi K2.6).
 
 ## Problemas frecuentes
 
@@ -97,6 +97,14 @@ Edita las variables `MODEL_TEXT`, `MODEL_TEXT_BACKUP`, `MODEL_AUDIO` o `MODEL_AU
 | «Formato de imagen no compatible» | Usa JPG, PNG o WebP. |
 
 Para ver errores en vivo con computadora: `npx wrangler tail`. Solo verás qué modelo falló y por qué, nunca el contenido clínico.
+
+## Cambios en v29.1
+
+- Fotos: primero Llama 4 Scout y luego Gemma 4, con límite de 2048 tokens (el JSON de una foto es corto).
+- Cada modelo tiene su propio tiempo; el de respaldo siempre alcanza a intentar.
+- A Gemma 4 se le pide no razonar de más (`enable_thinking: false`), para que responda más rápido.
+- El token ignora espacios o saltos de línea invisibles al inicio o al final.
+- Los errores dicen qué modelo falló y por qué.
 
 ## Qué cambió respecto al puente anterior (starter)
 

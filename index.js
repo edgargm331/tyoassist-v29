@@ -9,19 +9,24 @@
  * - No guarda ni registra el contenido clínico.
  */
 
-const VERSION = "29";
+const VERSION = "29.1";
 const SERVICE = "tyo-assist-proxy"; // nombre que espera el botón «Probar conexión» de la app
 
 const DEFAULTS = {
   MODEL_TEXT: "@cf/google/gemma-4-26b-a4b-it",
   MODEL_TEXT_BACKUP: "@cf/meta/llama-4-scout-17b-16e-instruct",
+  // Fotos: primero Llama 4 Scout (multimodal, responde sin «pensar»), luego Gemma 4.
+  MODEL_VISION: "@cf/meta/llama-4-scout-17b-16e-instruct",
+  MODEL_VISION_BACKUP: "@cf/google/gemma-4-26b-a4b-it",
   MODEL_AUDIO: "@cf/openai/whisper-large-v3-turbo",
   MODEL_AUDIO_BACKUP: "@cf/openai/whisper",
   MAX_OUTPUT_TOKENS: 4096
 };
 
 const BODY_LIMIT_BYTES = 8 * 1024 * 1024; // 8 MB (foto comprimida o audio de varios minutos)
-const TIME_BUDGET_MS = 38_000;            // la app corta a los 45 s
+const DEFAULT_TIME_BUDGET_MS = 40_000;    // la app corta a los 45 s
+const BACKUP_SHARE = 0.4;                 // parte del tiempo que siempre queda para el modelo de respaldo
+const VISION_MAX_TOKENS = 2048;           // las fotos devuelven JSON corto
 const MIN_TOKEN_LENGTH = 16;
 const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const LOCAL_ORIGINS = [
@@ -62,11 +67,27 @@ function json(data, status, headers) {
 function config(env) {
   const pick = (k) => String((env && env[k]) || "").trim() || DEFAULTS[k];
   const max = Number.parseInt(env && env.MAX_OUTPUT_TOKENS, 10);
+  const budget = Number.parseInt(env && env.TIME_BUDGET_MS, 10); // solo para pruebas automáticas
   return {
     textModels: unique([pick("MODEL_TEXT"), pick("MODEL_TEXT_BACKUP")]),
+    visionModels: unique([pick("MODEL_VISION"), pick("MODEL_VISION_BACKUP")]),
     audioModels: unique([pick("MODEL_AUDIO"), pick("MODEL_AUDIO_BACKUP")]),
-    maxTokens: Number.isFinite(max) ? Math.min(Math.max(max, 512), 8192) : DEFAULTS.MAX_OUTPUT_TOKENS
+    maxTokens: Number.isFinite(max) ? Math.min(Math.max(max, 512), 8192) : DEFAULTS.MAX_OUTPUT_TOKENS,
+    budget: Number.isFinite(budget) ? Math.min(Math.max(budget, 1000), 44_000) : DEFAULT_TIME_BUDGET_MS
   };
+}
+
+// Tiempo para un modelo: si hay respaldo después, se le reserva su parte para que siempre alcance a intentar.
+function attemptDeadline(start, cfg, isLast) {
+  const rem = cfg.budget - (Date.now() - start);
+  const min = minAttemptMs(cfg);
+  if (rem < min) return 0;
+  const cap = isLast ? rem : Math.max(min, rem - Math.round(cfg.budget * BACKUP_SHARE));
+  return Date.now() + cap;
+}
+
+function minAttemptMs(cfg) {
+  return Math.min(2500, Math.round(cfg.budget * 0.1));
 }
 
 function unique(list) {
@@ -140,8 +161,8 @@ function isFormatError(e) {
   return /json|schema|response_format|guided|format|additional propert|invalid input|unexpected/i.test(errorText(e));
 }
 
-function remaining(start) {
-  return TIME_BUDGET_MS - (Date.now() - start);
+function left(deadline) {
+  return deadline - Date.now();
 }
 
 // ---------------------------------------------------------------------------
@@ -367,13 +388,15 @@ async function transcribe(env, audios, sys, cfg, start) {
   for (const a of audios) {
     let done = false;
     let lastErr = null;
-    for (const model of cfg.audioModels) {
-      if (remaining(start) < 3000) break;
+    for (let i = 0; i < cfg.audioModels.length; i++) {
+      const model = cfg.audioModels[i];
+      const deadline = attemptDeadline(start, cfg, i === cfg.audioModels.length - 1);
+      if (!deadline) break;
       const input = model.includes("whisper-large-v3-turbo")
         ? { audio: a.data, language: "es", initial_prompt: prompt, vad_filter: true, condition_on_previous_text: false }
         : { audio: Array.from(base64ToBytes(a.data)) };
       try {
-        const out = await withTimeout(env.AI.run(model, input), remaining(start));
+        const out = await withTimeout(env.AI.run(model, input), left(deadline));
         const text = String((out && (out.text || (out.result && out.result.text))) || "").trim();
         texts.push(text);
         usedModel = model;
@@ -407,9 +430,11 @@ function tokenParam(model) {
   return /gemma-4/.test(model) ? "max_completion_tokens" : "max_tokens";
 }
 
-async function runChat(env, model, messages, opts, start) {
+async function runChat(env, model, messages, opts, deadline, minMs) {
   const base = { messages, temperature: opts.temperature };
   base[tokenParam(model)] = opts.maxTokens;
+  // Gemma 4 razona antes de responder; para redactar o extraer datos no hace falta y solo agrega espera.
+  if (/gemma-4/.test(model)) base.chat_template_kwargs = { enable_thinking: false };
   const withFormat = opts.schema
     ? { ...base, response_format: { type: "json_schema", json_schema: opts.schema } }
     : opts.wantsJson ? { ...base, response_format: { type: "json_object" } } : base;
@@ -417,9 +442,9 @@ async function runChat(env, model, messages, opts, start) {
   let input = withFormat;
   let capacityRetried = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (remaining(start) < 2500) throw new Reintentable("sin tiempo");
+    if (left(deadline) < minMs) throw new Reintentable("tiempo agotado");
     try {
-      const out = await withTimeout(env.AI.run(model, input), remaining(start));
+      const out = await withTimeout(env.AI.run(model, input), left(deadline));
       const { text, truncated } = extractOutput(out, opts.maxTokens);
       if (truncated) throw new Reintentable("respuesta incompleta");
       return text;
@@ -467,11 +492,15 @@ async function generate(body, env, start) {
     { role: "user", content: userContent }
   ];
 
+  const models = images.length ? cfg.visionModels : cfg.textModels;
+  const maxTokens = images.length ? Math.min(cfg.maxTokens, VISION_MAX_TOKENS) : cfg.maxTokens;
   const reasons = [];
-  for (const model of cfg.textModels) {
-    if (remaining(start) < 2500) break;
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const deadline = attemptDeadline(start, cfg, i === models.length - 1);
+    if (!deadline) break;
     try {
-      const text = await runChat(env, model, messages, { schema, wantsJson, temperature, maxTokens: cfg.maxTokens }, start);
+      const text = await runChat(env, model, messages, { schema, wantsJson, temperature, maxTokens }, deadline, minAttemptMs(cfg));
       if (wantsJson) {
         let obj = parseJsonLoose(text);
         if (!obj) throw new Reintentable("la respuesta no fue JSON válido");
@@ -482,8 +511,8 @@ async function generate(body, env, start) {
       return geminiEnvelope(text, model);
     } catch (e) {
       if (e instanceof PuenteError) throw e;
-      reasons.push(errorText(e).slice(0, 80));
-      console.log("puente: texto falló en " + model + ": " + reasons[reasons.length - 1]);
+      reasons.push(model.split("/").pop().split("-").slice(0, 2).join("-") + ": " + errorText(e).slice(0, 70));
+      console.log("puente: falló " + model + ": " + reasons[reasons.length - 1]);
     }
   }
   throw new PuenteError(502, "La IA gratuita no pudo completar la solicitud" + (reasons.length ? " (" + reasons.join(" / ") + ")" : "") + ". Intenta de nuevo en unos segundos.");
@@ -503,7 +532,7 @@ function health(env) {
     keyConfigured: !!(env.AI && typeof env.AI.run === "function"),
     tokenProtected: true,
     originsRestricted: configuredOrigins(env).length > 0,
-    models: { texto: cfg.textModels, audio: cfg.audioModels }
+    models: { texto: cfg.textModels, imagen: cfg.visionModels, audio: cfg.audioModels }
   };
 }
 
@@ -520,12 +549,13 @@ export default {
 
     const start = Date.now();
     try {
-      const expected = String((env && env.APP_ACCESS_TOKEN) || "");
+      // Se ignoran espacios y saltos de línea invisibles al inicio o al final (la app también los quita).
+      const expected = String((env && env.APP_ACCESS_TOKEN) || "").trim();
       if (expected.length < MIN_TOKEN_LENGTH) {
         throw new PuenteError(503, "Falta configurar el secreto APP_ACCESS_TOKEN en el Worker (mínimo 16 caracteres).");
       }
-      if (!safeEqual(String(request.headers.get("X-TyO-Token") || ""), expected)) {
-        throw new PuenteError(401, "Token incorrecto o faltante. Revisa el «Token de acceso personal» en ⚙️ Ajustes.");
+      if (!safeEqual(String(request.headers.get("X-TyO-Token") || "").trim(), expected)) {
+        throw new PuenteError(401, "Token incorrecto o faltante. Debe ser idéntico en ⚙️ Ajustes de la app y en el secreto APP_ACCESS_TOKEN de Cloudflare.");
       }
       if (request.method === "GET") return json(health(env), 200, cors);
       if (request.method !== "POST") throw new PuenteError(405, "Método no permitido.");
